@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Prompt before a commit on the default branch.
+
+Set REMOTE_LOOKUP to True to use origin's HEAD branch instead of master.
+Answers are read from /dev/tty so a multiplexer can keep Git's stdin.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+from typing import TextIO
+
+__version__ = "0.0.0"
+
+# False keeps the protected branch as master. True asks origin.
+REMOTE_LOOKUP: bool = False
+
+
+def resolve_git() -> str:
+    """Return the git binary on PATH. Exit if it is not installed."""
+    path = shutil.which("git")
+    if path is None:
+        print("git is not installed - Aborting", file=sys.stderr)
+        sys.exit(1)
+    return path
+
+
+def git_output(args: list[str]) -> str | None:
+    """Run git with a resolved binary. args excludes the git path."""
+    try:
+        process = subprocess.run(
+            [resolve_git(), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if process.returncode != 0:
+        return None
+    return process.stdout.strip()
+
+
+def default_branch() -> str:
+    """Return master, or origin's HEAD branch when REMOTE_LOOKUP is True."""
+    if REMOTE_LOOKUP is not True:
+        return "master"
+    output = git_output(["remote", "show", "origin"])
+    if not output:
+        return "master"
+    for line in output.splitlines():
+        if "HEAD branch" not in line or ":" not in line:
+            continue
+        name = line.split(":", 1)[1].strip()
+        if not name or name == "(unknown)":
+            return "master"
+        return name
+    return "master"
+
+
+class _Tty:
+    """Read and write handles for /dev/tty.
+
+    Python 3.13 refuses mode \"r+\" on a terminal because it is not seekable.
+    """
+
+    def __init__(self, reader: TextIO, writer: TextIO) -> None:
+        self._reader = reader
+        self._writer = writer
+
+    def write(self, text: str) -> None:
+        self._writer.write(text)
+
+    def flush(self) -> None:
+        self._writer.flush()
+
+    def readline(self) -> str:
+        return self._reader.readline()
+
+    def close(self) -> None:
+        self._reader.close()
+        self._writer.close()
+
+    def __enter__(self) -> _Tty:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+def open_tty() -> _Tty | None:
+    """Open the terminal, or None when there is no terminal."""
+    try:
+        reader = open("/dev/tty", encoding="utf-8")  # noqa: SIM115
+    except OSError:
+        return None
+    try:
+        writer = open("/dev/tty", "w", encoding="utf-8")  # noqa: SIM115
+    except OSError:
+        reader.close()
+        return None
+    return _Tty(reader, writer)
+
+
+def confirm(prompt: str) -> bool | None:
+    """Ask on /dev/tty. True is yes, False is no, None means no terminal."""
+    while True:
+        tty = open_tty()
+        if tty is None:
+            return None
+        with tty:
+            tty.write(prompt)
+            tty.flush()
+            line = tty.readline()
+        if line == "":
+            return False
+        answer = line.strip().lower()
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Invalid response. Please answer 'yes' or 'no'.", file=sys.stderr)
+
+
+def current_branch() -> str | None:
+    """Return the branch name. An unborn branch still has a name."""
+    name = git_output(["symbolic-ref", "--short", "HEAD"])
+    if name:
+        return name
+    # Detached HEAD. rev-parse exits 0 and prints HEAD. An unborn branch
+    # never reaches here: symbolic-ref already returned its name.
+    detached = git_output(["rev-parse", "--abbrev-ref", "HEAD"])
+    if detached == "HEAD":
+        return detached
+    return None
+
+
+def main() -> int:
+    """Exit 1 when the user refuses a commit on the protected branch."""
+    branch = default_branch()
+    current = current_branch()
+    if current is None:
+        print("Error: Failed to determine the current Git branch.", file=sys.stderr)
+        return 1
+    if current != branch:
+        return 0
+    prompt = f"Are you sure you want to commit to the {branch} branch? [Yes/No] "
+    answer = confirm(prompt)
+    if answer is None:
+        return 0
+    if not answer:
+        print("Commit aborted.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
